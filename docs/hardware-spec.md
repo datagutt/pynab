@@ -542,6 +542,27 @@ impl NabIO {
 }
 ```
 
+## Resource Lookup and Media Resolution
+
+- Treat every entry in a command or message sequence as a **relative resource identifier** (for example `"nabd/sounds/boot.wav"`). Reject absolute paths for safety.
+- Support **fallback lists** separated by semicolons. Probe each candidate until a file is found.
+- Respect **locale-aware lookups** by checking `app/type/<locale>/<filename>` first, then `app/type/<filename>` across all installed applications.
+- When a component starts with `*`, perform a **wildcard search** and choose a matching file at random (used for `asr/failed/*.mp3`).
+- **Cache and preload** resolved assets before playback to keep latency within the 50 ms goal.
+
+Packaging guidance: reuse the existing application layout so the Rust daemon, services, and tooling share media bundles without conversion.
+
+## Virtual Hardware Backend
+
+Provide a feature-parity development backend that mirrors the Python `NabIOVirtual` implementation:
+
+- Listen on `127.0.0.1:(NABD_PORT_NUMBER + 1)` and broadcast an ANSI-rendered rabbit state to connected clients.
+- Simulate button, ear, RFID, and audio events while still emitting the real protocol packets (`button_event`, `ear_event`, `rfid_event`).
+- Implement stubbed audio playback/recording that honours sequencing, cancellation, and response semantics.
+- Allow deterministic seeds so automated tests can assert LED/ear behaviour.
+
+Maintaining the virtual backend ensures developers can exercise the Rust stack without Raspberry Pi hardware.
+
 ## Error Handling
 
 ### Hardware-Specific Errors

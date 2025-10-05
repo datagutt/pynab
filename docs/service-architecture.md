@@ -147,6 +147,16 @@ impl Default for ClockServiceConfig {
 }
 ```
 
+### Connection Workflow
+
+Services follow a deterministic handshake:
+
+1. `NabdClient::connect` opens the TCP stream and waits for the initial `state` packet.
+2. The client immediately sends a `mode` packet with `mode = "idle"` plus desired event subscriptions.
+3. Incoming packets are fanned into `handle_packet`, which must process `response` statuses and event payloads.
+4. When exclusive access is needed (for example, a voice interaction), the service sends `mode = "interactive"` and waits for the `state` transition to `interactive` before issuing commands.
+5. On shutdown or signal handling, services should revert to `mode = "idle"`, flush outstanding work, and close the connection gracefully.
+
 ## Service Base Implementation
 
 ### Base Service Structure
@@ -179,7 +189,11 @@ impl BaseService {
     
     pub async fn connect_to_nabd(&self) -> Result<(), ServiceError> {
         let client = NabdClient::connect("127.0.0.1:10543").await?;
-        client.register(self.name).await?;
+        client.send_packet(NabPacket::Mode {
+            mode: NabMode::Idle,
+            events: Some(vec!["button".into(), "ears".into()]),
+            request_id: None,
+        }).await?;
         
         let mut client_guard = self.client.lock().await;
         *client_guard = Some(client);

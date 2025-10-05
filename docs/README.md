@@ -6,7 +6,7 @@ This directory contains the complete specification and implementation plan for r
 
 ### 📋 Implementation Plans
 - **[Rust Implementation Plan](rust-implementation.md)** - Complete roadmap for Rust rewrite with architecture, dependencies, and implementation phases
-- **[Migration Strategy](migration-strategy.md)** - Step-by-step migration from Python to Rust with rollback procedures
+- **[Migration Strategy](rust-implementation.md#migration-strategy)** - Step-by-step migration from Python to Rust with rollback procedures
 
 ### 🔧 Technical Specifications  
 - **[Protocol Specification](protocol-spec.md)** - Complete nabd protocol definition with packet types and communication patterns

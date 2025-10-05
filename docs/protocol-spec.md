@@ -14,10 +14,11 @@ The Nabd protocol is a JSON-based TCP protocol running on port 10543 that enable
 - **Message Delimiter**: Newline character (`\n`)
 
 ### Client Connection Lifecycle
-1. **Connect** - TCP connection established
-2. **Register** - Service sends registration packet
-3. **Active** - Bidirectional message exchange
-4. **Disconnect** - Connection closed (graceful or abrupt)
+1. **Connect** – TCP connection established
+2. **State Bootstrap** – nabd immediately sends the current `state` packet
+3. **Subscription** – Client sends a `mode` packet to declare interest in events
+4. **Active** – Bidirectional message exchange (commands, events, responses)
+5. **Disconnect** – Connection closed (graceful or abrupt)
 
 ## Message Format
 
@@ -33,37 +34,14 @@ All messages are JSON objects terminated by a newline character.
 ```
 
 ### Message Types
-- **Commands**: Client → Server requests
-- **Responses**: Server → Client responses to commands
-- **Events**: Server → Client notifications
-- **Info**: Bidirectional status/capability messages
+- **Commands** – Client → Server requests that nabd enqueues or executes
+- **Responses** – Server → Client acknowledgements with status payloads
+- **Events** – Server → Client notifications (button, RFID, ASR, state, etc.)
+- **Info** – Bidirectional updates used for idle LED animations and metadata
 
 ## Packet Types
 
-### 1. Registration Packets
-
-#### Service Registration
-**Direction**: Client → Server  
-**Purpose**: Register a service with nabd
-
-```json
-{
-  "type": "register",
-  "service": "service_name",
-  "request_id": "unique_id"
-}
-```
-
-**Response**:
-```json
-{
-  "type": "response",
-  "request_id": "unique_id",
-  "status": "ok"
-}
-```
-
-### 2. Information Packets
+### 1. Information Packets
 
 #### Info Request
 **Direction**: Client → Server  
@@ -102,7 +80,7 @@ All messages are JSON objects terminated by a newline character.
 }
 ```
 
-### 3. State Management
+### 2. State Management
 
 #### State Change Command
 **Direction**: Client → Server  
@@ -128,198 +106,228 @@ All messages are JSON objects terminated by a newline character.
 }
 ```
 
-### 4. Hardware Control
+### 3. Command & Message Packets
 
-#### LED Commands
-```json
-{
-  "type": "led",
-  "led": 0,
-  "color": "ff0000",
-  "request_id": "unique_id"
-}
-```
+Commands and messages wrap LED, audio, and choreography instructions instead of sending low-level “led” or “play_audio” packets.
+
+#### Command Packet
+**Direction**: Client → Server  
+**Purpose**: Queue a sequence for idle playback
 
 ```json
 {
-  "type": "leds",
-  "leds": [
-    {"led": 0, "color": "ff0000"},
-    {"led": 1, "color": "00ff00"},
-    {"led": 2, "color": "0000ff"},
-    {"led": 3, "color": "ffff00"},
-    {"led": 4, "color": "ff00ff"}
-  ],
-  "request_id": "unique_id"
+  "type": "command",
+  "request_id": "abcd-1234",
+  "cancelable": true,
+  "expiration": "2025-10-05T16:30:00Z",
+  "sequence": [
+    {"audio": ["myapp/sounds/hello.mp3"]},
+    {"choreography": "myapp/choreographies/wave.chor"}
+  ]
 }
 ```
 
-#### Ear Commands
+#### Message Packet
+Used for the legacy “signature + body + signature” flow.
+
 ```json
 {
-  "type": "ears",
-  "left": 0,
-  "right": 10,
-  "request_id": "unique_id"
+  "type": "message",
+  "request_id": "msg-42",
+  "signature": {"audio": ["hello/signature.mp3"]},
+  "body": [
+    {"audio": ["hello/body.mp3"], "choreography": "hello/body.chor"}
+  ]
 }
 ```
 
-Position range: -17 to 17 (0 = center, negative = backward, positive = forward)
+**Execution model**
+- Packets are enqueued when nabd is `idle`; during `playing` they run to completion.
+- Nabd automatically clears expired commands (`status = "expired"`).
+- The `cancelable` flag allows the user button (short click) to abort playback.
 
-#### Audio Commands
+### 4. Mode Packets & Interactive Ownership
 
-**Play Audio**:
 ```json
 {
-  "type": "play_audio",
-  "audio_file": "/path/to/audio.wav",
-  "request_id": "unique_id"
+  "type": "mode",
+  "mode": "idle",
+  "events": ["button", "ears", "rfid/weather"]
 }
 ```
 
-**Record Audio**:
+- `mode = "idle"` registers for broadcast events listed in `events`. Wildcards (`"rfid/*"`, `"asr/*"`) are supported.
+- `mode = "interactive"` requests exclusive control. Nabd queues the request and, once granted, subsequent commands from that writer execute immediately. The service must later send `mode: "idle"` to release control.
+
+### 5. Sleep & Wake Control
+
+```json
+{"type": "sleep", "request_id": "sleep-1"}
+```
+
+Sleep packets are queued. Once all pending non-sleep items are done, nabd transitions to `asleep` and responds `status = "ok"`. Wake packets transition to `idle` immediately if currently asleep.
+
+### 6. Cancel Packets
+
 ```json
 {
-  "type": "record_audio",
-  "duration": 5.0,
-  "request_id": "unique_id"
+  "type": "cancel",
+  "request_id": "abcd-1234"
 }
 ```
 
-**Stop Audio**:
+Cancels the in-progress command/message if the `request_id` matches and it was marked `cancelable`.
+
+### 7. Info Packets (Idle Animations)
+
 ```json
 {
-  "type": "stop_audio",
-  "request_id": "unique_id"
+  "type": "info",
+  "info_id": "weather",
+  "animation": {
+    "tempo": 12,
+    "colors": [
+      {"left": "ff9900", "center": "ffffff", "right": "ff9900"}
+    ]
+  }
 }
 ```
 
-### 5. Choreography System
+Providing an `animation` stores it in the idle info map. Sending the same `info_id` without the animation removes it. Nabd rotates stored animations whenever the idle queue is empty.
 
-#### Choreography Command
+### 8. Hardware Diagnostics
+
+#### Test Packet
+
 ```json
 {
-  "type": "choreography",
-  "choreography": "choreography_data",
-  "request_id": "unique_id"
+  "type": "test",
+  "test": "ears",
+  "request_id": "test-ears"
 }
 ```
 
-#### Choreography Format
-Choreographies are JSON arrays of timed actions:
+Supported tests: `"ears"`, `"leds"`. Tests run immediately if asleep; otherwise they queue in idle order.
+
+#### Gestalt Packet
+
 ```json
-[
-  {"tempo": 10, "colors": ["ff0000", "00ff00", "0000ff", "ffff00", "ff00ff"]},
-  {"tempo": 5, "left": 5, "right": -5},
-  {"tempo": 15, "audio": "/path/to/sound.wav"},
-  {"tempo": 20, "colors": ["000000", "000000", "000000", "000000", "000000"]}
-]
+{
+  "type": "gestalt",
+  "request_id": "g1"
+}
 ```
 
-### 6. Event Packets
+Returns uptime, current state, connection count, and hardware metadata.
+
+### 9. RFID Write
+
+```json
+{
+  "type": "rfid_write",
+  "request_id": "rfid-1",
+  "tech": "st25r391x",
+  "uid": "04:52:de:ad:be:ef:42",
+  "picture": 12,
+  "app": "nabd",
+  "data": "custom payload",
+  "timeout": 5.0
+}
+```
+
+If hardware is absent, nabd replies with an error class such as `NFCException`. The daemon provides user feedback (LED pulse + sound) during the operation.
+
+### 10. Configuration & Shutdown
+
+```json
+{"type": "config-update", "service": "nabd", "slot": "locale"}
+```
+
+Triggers locale reloads. Other services may define additional slots.
+
+```json
+{"type": "shutdown", "mode": "reboot", "request_id": "reboot-1"}
+```
+
+Queues a system halt or reboot after ears and LEDs are put in a safe state.
+
+### 11. Event Packets
 
 #### Button Event
-**Direction**: Server → Clients  
-**Purpose**: Notify of button press/release
-
 ```json
 {
   "type": "button_event",
-  "event": "down|up|click|double_click|long_press"
+  "event": "down|up|click|double_click|hold|triple_click",
+  "time": 1696521600.123
 }
 ```
 
 #### Ear Event
-**Direction**: Server → Clients  
-**Purpose**: Notify of ear position changes
+Emitted either for explicit `ears` commands (with `event: true`) or after physical movement detection.
 
 ```json
-{
-  "type": "ear_event",
-  "ear": "left|right",
-  "position": 5
-}
+{"type": "ear_event", "ear": "left", "position": 4, "time": 1696521605.0}
 ```
 
 #### RFID Event
-**Direction**: Server → Clients  
-**Purpose**: Notify of RFID tag detection
 
 ```json
 {
   "type": "rfid_event",
+  "tech": "st25r391x",
   "uid": "04:52:de:ad:be:ef:42",
-  "picture": 255,
-  "app": "service_name",
-  "data": "tag_specific_data"
+  "event": "detected|removed",
+  "support": "formatted|foreign-data|locked|empty|unknown",
+  "picture": 12,
+  "app": "weather",
+  "data": "serialized payload",
+  "time": 1696521610.45
 }
 ```
 
-#### ASR Event (Automatic Speech Recognition)
-**Direction**: Server → Clients  
-**Purpose**: Notify of speech recognition results
+#### ASR Event
 
 ```json
 {
   "type": "asr_event",
-  "text": "recognized text",
-  "confidence": 0.85,
-  "intent": {
-    "name": "intent_name",
-    "parameters": {"param1": "value1"}
-  }
+  "nlu": {"intent": "nlu/weather", "slots": {"city": "Paris"}},
+  "time": 1696521622.9
 }
 ```
 
-### 7. Service Interaction
+#### State Event
 
-#### Service Request
-**Direction**: Client → Server → Target Client  
-**Purpose**: Inter-service communication
+```json
+{"type": "state", "state": "idle"}
+```
+
+### 12. Response Payloads
+
+All server acknowledgements use:
 
 ```json
 {
-  "type": "service_request",
-  "service": "target_service",
-  "request": {
-    "type": "custom_request",
-    "data": "request_specific_data"
-  },
-  "request_id": "unique_id"
+  "type": "response",
+  "request_id": "abcd-1234",
+  "status": "ok|failure|error|expired|timeout|canceled",
+  "class": "OptionalErrorClass",
+  "message": "Optional detail"
 }
 ```
 
-#### Service Response
-**Direction**: Target Client → Server → Original Client
+- `status = "ok"` – request accepted/completed.
+- `status = "failure"` – command executed but reported failure (e.g., `test` result `False`).
+- `status = "error"` with `class`/`message` – validation or runtime error.
+- `status = "expired"` – queued command elapsed before execution.
+- `status = "timeout"` – RFID write timed out waiting for a tag.
+- `status = "canceled"` – playback was canceled by user input.
 
-```json
-{
-  "type": "service_response",
-  "request_id": "unique_id",
-  "response": {
-    "type": "custom_response",
-    "data": "response_specific_data"
-  }
-}
-```
+### 13. Idle Queue Behaviour Summary
 
-### 8. Command Sequencing
-
-#### Command Sequence
-**Direction**: Client → Server  
-**Purpose**: Execute multiple commands in sequence
-
-```json
-{
-  "type": "sequence",
-  "sequence": [
-    {"type": "led", "led": 0, "color": "ff0000"},
-    {"type": "ears", "left": 10, "right": -10},
-    {"type": "play_audio", "audio_file": "/path/to/sound.wav"}
-  ],
-  "request_id": "unique_id"
-}
-```
+1. Commands, messages, tests, `sleep`, `rfid_write`, and `mode=interactive` are appended to an internal queue while nabd is `idle`.
+2. `sleep` waits until all other queue items drain; if only sleeps remain, nabd transitions to `asleep` immediately.
+3. While `interactive`, commands from the owning writer bypass the queue; other writers still enqueue.
+4. Idle animations from `info` packets run whenever the queue is empty, rotating through stored `info_id`s.
 
 ### 9. Sleep Management
 
