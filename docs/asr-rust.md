@@ -84,4 +84,418 @@ let result = recognizer.partial_result()?; // or final_result()
 - Should the Rust API mirror the existing `get_decoded_string` pull model or adopt a streaming callback that better suits async Rust services?
 - Under what conditions would we reevaluate Vosk (e.g., upstream ARMv6 binaries, community-maintained forks), and how do we detect that early?
 
-Document authored October 5, 2025.
+## Implementation Plan: Kaldi FFI for Rust
+
+### Minimal Kaldi API Surface
+
+Based on analysis of `nabd/asr.py`, the Python integration requires only three core operations:
+
+1. **Model Loading** - `KaldiNNet3OnlineModel(path, max_mem=20000)`
+2. **Streaming Decode** - `decoder.decode(sample_rate, samples_array, finalize_flag)`
+3. **Hypothesis Retrieval** - `decoder.get_decoded_string()` → `(text, likelihood)`
+
+The underlying `py-kaldi-asr` bindings wrap these Kaldi C++ classes:
+
+- `OnlineNnet3DecodingConfig` - decoder configuration
+- `LatticeFasterDecoderConfig` - lattice search parameters  
+- `TransitionModel`, `nnet3::AmNnetSimple` - acoustic model
+- `fst::Fst<fst::StdArc>` - decoding graph (HCLG.fst)
+- `OnlineNnet2FeaturePipeline` - MFCC/i-vector extraction
+- `SingleUtteranceNnet3Decoder` - incremental decoder instance
+
+### Proposed Rust FFI Architecture
+
+```
+┌─────────────────────────────────────┐
+│   nabd (Rust)                       │
+│   ├─ asr::KaldiDecoder (safe API)  │
+│   └─ tokio async runtime            │
+└──────────────┬──────────────────────┘
+               │
+┌──────────────▼──────────────────────┐
+│   kaldi-sys (FFI bindings)          │
+│   ├─ build.rs (cxx bridge)         │
+│   └─ src/bridge.rs (C++ shims)     │
+└──────────────┬──────────────────────┘
+               │
+┌──────────────▼──────────────────────┐
+│   libkaldi-online2-lite.so          │
+│   (stripped Kaldi runtime)          │
+│   ~40-60 MB ARMv6/ARMv7             │
+└─────────────────────────────────────┘
+```
+
+### C++ Bridge Interface
+
+Create a minimal C-compatible shim layer exposing only required operations:
+
+```cpp
+// kaldi_bridge.h
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct KaldiModel KaldiModel;
+typedef struct KaldiDecoder KaldiDecoder;
+
+KaldiModel* kaldi_model_new(const char* model_path, int32_t max_mem_mb);
+void kaldi_model_free(KaldiModel* model);
+
+KaldiDecoder* kaldi_decoder_new(KaldiModel* model);
+void kaldi_decoder_free(KaldiDecoder* decoder);
+
+int kaldi_decoder_decode(
+    KaldiDecoder* decoder,
+    float sample_rate,
+    const float* samples,
+    size_t num_samples,
+    int finalize
+);
+
+int kaldi_decoder_get_result(
+    KaldiDecoder* decoder,
+    char* text_buf,
+    size_t buf_size,
+    float* likelihood
+);
+
+#ifdef __cplusplus
+}
+#endif
+```
+
+### Rust Safe Wrapper
+
+```rust
+// kaldi-sys/src/lib.rs
+#![allow(non_upper_case_globals)]
+#![allow(non_camel_case_types)]
+
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_float, c_int};
+
+#[repr(C)]
+struct KaldiModel {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct KaldiDecoder {
+    _private: [u8; 0],
+}
+
+extern "C" {
+    fn kaldi_model_new(model_path: *const c_char, max_mem_mb: i32) -> *mut KaldiModel;
+    fn kaldi_model_free(model: *mut KaldiModel);
+    fn kaldi_decoder_new(model: *mut KaldiModel) -> *mut KaldiDecoder;
+    fn kaldi_decoder_free(decoder: *mut KaldiDecoder);
+    fn kaldi_decoder_decode(
+        decoder: *mut KaldiDecoder,
+        sample_rate: c_float,
+        samples: *const c_float,
+        num_samples: usize,
+        finalize: c_int,
+    ) -> c_int;
+    fn kaldi_decoder_get_result(
+        decoder: *mut KaldiDecoder,
+        text_buf: *mut c_char,
+        buf_size: usize,
+        likelihood: *mut c_float,
+    ) -> c_int;
+}
+
+pub struct Model {
+    ptr: *mut KaldiModel,
+}
+
+pub struct Decoder {
+    ptr: *mut KaldiDecoder,
+}
+
+impl Model {
+    pub fn load(path: &str, max_mem_mb: i32) -> Result<Self, String> {
+        let c_path = CString::new(path).map_err(|e| e.to_string())?;
+        let ptr = unsafe { kaldi_model_new(c_path.as_ptr(), max_mem_mb) };
+        if ptr.is_null() {
+            Err("Failed to load Kaldi model".into())
+        } else {
+            Ok(Model { ptr })
+        }
+    }
+}
+
+impl Drop for Model {
+    fn drop(&mut self) {
+        unsafe { kaldi_model_free(self.ptr) };
+    }
+}
+
+impl Decoder {
+    pub fn new(model: &Model) -> Result<Self, String> {
+        let ptr = unsafe { kaldi_decoder_new(model.ptr) };
+        if ptr.is_null() {
+            Err("Failed to create decoder".into())
+        } else {
+            Ok(Decoder { ptr })
+        }
+    }
+
+    pub fn decode(&mut self, samples: &[f32], finalize: bool) -> Result<(), String> {
+        let result = unsafe {
+            kaldi_decoder_decode(
+                self.ptr,
+                16000.0,
+                samples.as_ptr(),
+                samples.len(),
+                finalize as c_int,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err("Decode failed".into())
+        }
+    }
+
+    pub fn get_result(&self) -> Result<(String, f32), String> {
+        let mut buf = vec![0u8; 1024];
+        let mut likelihood: c_float = 0.0;
+        
+        let result = unsafe {
+            kaldi_decoder_get_result(
+                self.ptr,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+                &mut likelihood,
+            )
+        };
+        
+        if result == 0 {
+            let text = unsafe {
+                CStr::from_ptr(buf.as_ptr() as *const c_char)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            Ok((text, likelihood))
+        } else {
+            Err("Failed to get result".into())
+        }
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        unsafe { kaldi_decoder_free(self.ptr) };
+    }
+}
+
+unsafe impl Send for Model {}
+unsafe impl Send for Decoder {}
+```
+
+### ARMv6/ARMv7 Cross-Compilation Strategy
+
+#### Toolchain Setup
+
+Use `cross` for reproducible Docker-based cross-compilation:
+
+```toml
+# Cross.toml
+[target.armv6-unknown-linux-gnueabihf]
+image = "pynab/kaldi-cross:armv6"
+pre-build = [
+    "dpkg --add-architecture armhf",
+    "apt-get update",
+    "apt-get install -y libopenblas-dev:armhf",
+]
+
+[target.armv7-unknown-linux-gnueabihf]
+image = "pynab/kaldi-cross:armv7"
+pre-build = [
+    "dpkg --add-architecture armhf",
+    "apt-get update", 
+    "apt-get install -y libopenblas-dev:armhf",
+]
+```
+
+#### Kaldi Build Configuration
+
+Minimize binary size by disabling unused features:
+
+```bash
+# build-kaldi-lite.sh
+#!/bin/bash
+set -e
+
+KALDI_ROOT="/opt/kaldi"
+TARGET_ARCH="${1:-armv7-unknown-linux-gnueabihf}"
+
+cd $KALDI_ROOT/src
+
+# Configure minimal build
+cat > kaldi.mk <<EOF
+DOUBLE_PRECISION = 0
+OPENFSTLIBS = -lfst
+OPENFSTLDFLAGS = -L/usr/lib
+ATLASINC = /usr/include
+ATLASLIBS = -lopenblas -llapack
+CXXFLAGS = -std=c++14 -O3 -fPIC -DNDEBUG
+EOF
+
+# Build only required components
+make -j$(nproc) \
+    base/libkaldi-base.so \
+    matrix/libkaldi-matrix.so \
+    feat/libkaldi-feat.so \
+    transform/libkaldi-transform.so \
+    gmm/libkaldi-gmm.so \
+    tree/libkaldi-tree.so \
+    hmm/libkaldi-hmm.so \
+    lat/libkaldi-lat.so \
+    decoder/libkaldi-decoder.so \
+    fstext/libkaldi-fstext.so \
+    util/libkaldi-util.so \
+    nnet3/libkaldi-nnet3.so \
+    online2/libkaldi-online2.so
+
+# Strip debug symbols
+find . -name "*.so" -exec strip --strip-debug {} \;
+```
+
+#### Build System Integration
+
+```toml
+# kaldi-sys/Cargo.toml
+[package]
+name = "kaldi-sys"
+version = "0.1.0"
+edition = "2021"
+links = "kaldi-online2-lite"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.0"
+pkg-config = "0.3"
+
+[package.metadata.cross.target.armv6-unknown-linux-gnueabihf]
+env.passthrough = ["KALDI_ROOT"]
+
+[package.metadata.cross.target.armv7-unknown-linux-gnueabihf]  
+env.passthrough = ["KALDI_ROOT"]
+```
+
+```rust
+// kaldi-sys/build.rs
+use std::env;
+use std::path::PathBuf;
+
+fn main() {
+    let kaldi_root = env::var("KALDI_ROOT").unwrap_or_else(|_| "/opt/kaldi".to_string());
+    let kaldi_lib = format!("{}/src/lib", kaldi_root);
+    
+    println!("cargo:rustc-link-search=native={}", kaldi_lib);
+    println!("cargo:rustc-link-lib=kaldi-online2");
+    println!("cargo:rustc-link-lib=kaldi-decoder");
+    println!("cargo:rustc-link-lib=kaldi-lat");
+    println!("cargo:rustc-link-lib=kaldi-hmm");
+    println!("cargo:rustc-link-lib=kaldi-feat");
+    println!("cargo:rustc-link-lib=kaldi-transform");
+    println!("cargo:rustc-link-lib=kaldi-gmm");
+    println!("cargo:rustc-link-lib=kaldi-tree");
+    println!("cargo:rustc-link-lib=kaldi-util");
+    println!("cargo:rustc-link-lib=kaldi-matrix");
+    println!("cargo:rustc-link-lib=kaldi-base");
+    println!("cargo:rustc-link-lib=kaldi-nnet3");
+    println!("cargo:rustc-link-lib=kaldi-fstext");
+    println!("cargo:rustc-link-lib=fst");
+    println!("cargo:rustc-link-lib=openblas");
+    
+    cc::Build::new()
+        .cpp(true)
+        .flag("-std=c++14")
+        .include(format!("{}/src", kaldi_root))
+        .file("src/kaldi_bridge.cpp")
+        .compile("kaldi-bridge");
+    
+    println!("cargo:rerun-if-changed=src/kaldi_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/kaldi_bridge.h");
+}
+```
+
+### High-Level Rust API for nabd
+
+```rust
+// nabd/src/asr.rs
+use kaldi_sys::{Decoder, Model};
+use std::collections::HashMap;
+use std::path::Path;
+use tokio::sync::mpsc;
+
+pub struct AsrService {
+    model: Model,
+    decoder: Option<Decoder>,
+}
+
+impl AsrService {
+    pub fn new(locale: &str) -> Result<Self, String> {
+        let model_path = Self::get_model_path(locale);
+        let model = Model::load(&model_path, 20000)?;
+        Ok(AsrService {
+            model,
+            decoder: None,
+        })
+    }
+    
+    fn get_model_path(locale: &str) -> String {
+        let models: HashMap<&str, &str> = [
+            ("fr_FR", "/opt/kaldi/model/kaldi-nabaztag-fr-adapt-r20200203"),
+            ("en_GB", "/opt/kaldi/model/kaldi-nabaztag-en-adapt-r20191222"),
+            ("en_US", "/opt/kaldi/model/kaldi-nabaztag-en-adapt-r20191222"),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+        
+        models
+            .get(locale)
+            .unwrap_or(&"/opt/kaldi/model/kaldi-nabaztag-fr-adapt-r20200203")
+            .to_string()
+    }
+    
+    pub fn start_utterance(&mut self) -> Result<(), String> {
+        self.decoder = Some(Decoder::new(&self.model)?);
+        Ok(())
+    }
+    
+    pub fn decode_chunk(&mut self, samples_i16: &[i16], finalize: bool) -> Result<(), String> {
+        let samples_f32: Vec<f32> = samples_i16.iter().map(|&s| s as f32).collect();
+        
+        if let Some(decoder) = &mut self.decoder {
+            decoder.decode(&samples_f32, finalize)
+        } else {
+            Err("No active decoder".into())
+        }
+    }
+    
+    pub fn get_result(&self) -> Result<String, String> {
+        if let Some(decoder) = &self.decoder {
+            let (text, _likelihood) = decoder.get_result()?;
+            Ok(text)
+        } else {
+            Err("No active decoder".into())
+        }
+    }
+}
+```
+
+### Next Steps
+
+1. **Prototype C++ bridge** - Implement `kaldi_bridge.cpp` wrapping OnlineNnet3 decoder
+2. **Test on development machine** - Validate API parity with existing Python integration
+3. **Build stripped Kaldi libraries** - Measure binary size (target <60 MB)
+4. **Setup cross-compilation** - Create Docker images for ARMv6/ARMv7 toolchains
+5. **Field test on Pi Zero W** - Validate memory footprint and latency
+6. **Integration testing** - Run against existing model bundles from `asr/` directory
+
+Document updated October 5, 2025.
